@@ -1,6 +1,5 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "framework": "other",
   "buildCommand": "export LANG=C.UTF-8 LC_ALL=C.UTF-8 BUNDLE_WITHOUT=test && bundle config set path vendor/bundle && bundle install --jobs=4 --retry=3 && npm ci && npm run build:js && JEKYLL_ENV=production bundle exec jekyll build",
   "outputDirectory": "_site"
 }
