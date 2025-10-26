@@ -1,0 +1,5 @@
+{
+  "framework": null,
+  "buildCommand": "bundle config set path vendor/bundle && bundle install && npm ci && npm run build:js && bundle exec jekyll build",
+  "outputDirectory": "_site"
+}
