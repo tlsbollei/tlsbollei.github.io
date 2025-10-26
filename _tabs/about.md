@@ -4,7 +4,7 @@ icon: fas fa-info-circle
 order: 5
 ---
 
-# 🔧 Samuel Varga (tlsbollei)
+#  Samuel Varga (tlsbollei)
 
 > *"May your EDR kick in before reality does."*
 
@@ -26,7 +26,7 @@ The world of threat intelligence fascinates me - the very act of hunting down th
 * **APT emulation & offensive research**: I study attacker tradecraft end-to-end, idolize the technical skill of top-tier APTs, and emulate their methodologies to harden real-world environments.
 * **CTF player**: I represent my country, Slovakia, in CTFs, and I also play for top-tier teams such as **ARESx**, **Friendly Maltese Citizens**, placing on the podium on many top tier CTFs and qualifying for on-site finals in Japan, Tunisia, Italy...
 
-## ✦ Some things I’ve worked on:
+## Some things I’ve worked on:
 
 * **Windows research**: I've led research on syscall hook detection and termination for evasion, KPP (PatchGuard) thread termination along with more kernel-land research. I've also researched and published novel methods of syscall hook invocation, [GhostSys](https://github.com/tlsbollei/GhostSys/blob/main/paper/ghostsys.pdf), but generally focusing on general Windows Internals study.
 * **EDR/AV bypass PoCs**: Crafted reproducible proofs-of-concept that show how modern mitigations can be sidestepped and how detection logic should evolve in response.
