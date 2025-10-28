@@ -101,7 +101,7 @@ theme_mode: dark
 cdn:
 
 # the avatar on sidebar, support local or CORS resources
-avatar: "imgs/general/logo.png"
+avatar: "imgs/general/oki.png"
 
 # The URL of the site-wide social preview image used in SEO `og:image` meta tag.
 # It can be overridden by a customized `page.image` in front matter.
@@ -227,4 +227,5 @@ jekyll-archives:
   permalinks:
     tag: /tags/:name/
     category: /categories/:name/
+
 
