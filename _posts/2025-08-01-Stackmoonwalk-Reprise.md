@@ -1,13 +1,368 @@
 ---
-title: "SilentMoonwalk: Implementing a dynamic Call Stack Spoofer"
-date: 2022-12-08 20:00:00 +0100
-categories: [Evasion, Stack Spoofing]
-tags: [evasion, stack-spoofing]     # TAG names should always be lowercase
+title: "Windows Syscalls in 2025: Direct, Indirect, and the Hardware-Assisted Arms Race"
+date: 202-11-23 14:20:00 +0100
+categories: [Evasion, Malware, Syscalls]
+tags: [evasion, malware, system-calls]     # TAG names should always be lowercase
 ---
 
-# SilentMoonwalk: Implementing a dynamic Call Stack Spoofer
 
-## TL;DR
+## 0. Why syscalls are still the battleground in 2025
+
+On modern Windows, practically every meaningful offensive action eventually goes through a system call:
+
+- allocate / RWX memory  
+- write to another process  
+- map sections / hollow processes  
+- manipulate tokens, registry, file system, and many more.
+
+Historically, defenders sat on the “API” layer: `kernel32.dll`, `kernelbase.dll`, `ntdll.dll`, hook a few  functions, gain visibility into most malicious behaviors. Attackers responded with:
+
+- **Direct syscalls** (SysWhispers, Hell’s Gate, and more): emit the `syscall` instruction yourself, bypassing user-mode hooks.
+- **Indirect syscalls**: still use the syscall stub inside `ntdll.dll` but reach it in unintended ways (shadow copies, ROP, or carefully spoofed call stacks).
+- **Call stack spoofing / VEH-based tricks**: craft call stacks to fool EDR stack walkers.
+- **Dynamic & encrypted syscall stubs**: avoid signatureable patterns in memory.
+
+By 2025, this cat-and-mouse game has moved decisively much *below* simple user-mode hooking:
+
+- Some EDRs intercept syscalls in **kernel-mode**, dump the `KTRAP_FRAME`, and map the saved RIP back to the calling module (like we have seen in Cortex XDR’s `ImageTracker` component). 
+- Windows 11 deployments increasingly run with **CET shadow stacks** (user and in some environments kernel) and hardware telemetry (Intel PT / LBR / PMU) feeding EDR analytics engines. 
+
+The result: pure “direct syscall or bust” has become a losing strategy. The meta is now layered:
+
+- Indirect / “recycled” syscalls that preserve plausible call stacks.
+- Call-stack spoofing (VEH-based, ROP-less, CET-aware).
+- Dynamic, encrypted syscall stubs to resist static + memory scanning.
+- Behavioral / kernel / hardware-based detection on the defensive side.
+
+Therefore, the graph now looks less like this :
+
+![usr](https://raw.githubusercontent.com/tlsbollei/tlsbollei.github.io/refs/heads/master/imgs/blog/006Spoofing/usr.png)
+
+
+But more like this :
+
+![more](https://raw.githubusercontent.com/tlsbollei/tlsbollei.github.io/refs/heads/master/imgs/blog/006Spoofing/more.png)
+
+
+To understand why, we need to get precise about how syscalls actually work on x64 Windows.
+
+## 1. The x64 syscall pipeline, end-to-end
+
+### 1.1 From `CreateFileW` to `KiSystemCall64`
+
+Let’s follow a boring system call on a 64-bit process on modern Windows 10/11.
+
+**User-mode call chain** (happy path):
+
+```txt
+YourCode!DoSomethingCool()
+  → kernel32!CreateFileW
+      → kernelbase!CreateFileW
+          → kernelbase!CreateFileInternal 
+              → ntdll!NtCreateFile
+                   → ntdll!syscall stub
+                       → SYSCALL #NN (SSN) 
+```
+
+In a conventional flow, the syscall instruction lives inside ntdll.dll (ntdll!Nt* or Zw* stubs, and for GUI syscalls sometimes win32u.dll). 
+
+That last step in user-mode is the only piece you really need to fake to perform direct syscalls, which is exactly what offensive tools do, and have done for a long time.
+
+
+### 1.2 The ntdll syscall stub
+
+A typical x64 Nt* stub (heavily simplified) looks like this:
+
+```
+NtAllocateVirtualMemory:
+    mov     r10, rcx         
+    mov     eax, 0x18        
+    syscall                  
+    ret
+```
+
+This is very basic, but given a short introduction to a reader who is new to windows internals :
+
+
+- RCX is copied into R10 before syscall which is mandated calling convention for the kernel entry stub.
+- EAX contains the System Service Number (SSN) which is an index into the SSDT (System Service Descriptor Table) dispatch table.
+- Arguments are passed in the usual x64 calling-convention registers / stack, kernel uses the same layout.
+- EDRs often hook at this level, what they do is patch the prologue to jump into their proxy, then back into a trampoline. This is the basis of **user-mode hooking**, which includes IAT hooking, inline hooking etc.
+
+### 1.3 SYSCALL entry and the KTRAP_FRAME
+
+On x64, the user to kernel transition is driven by `MSR_LSTAR`, which points to the kernel’s syscall entry, which is usually `nt!KiSystemCall64`.
+
+![cmp](https://raw.githubusercontent.com/tlsbollei/tlsbollei.github.io/refs/heads/master/imgs/blog/006Spoofing/cmp.png)
+
+The KTRAP_FRAME is crucial as it contains the snapshot of the interrupted user-mode context, including the address to resume execution (i.e., the RIP after the syscall instruction). That saved RIP is exactly what some EDRs now use to detect direct syscalls.
+
+### 1.4 Service tables, SSDT and friends
+
+The syscall index (EAX) is used as an index into a service table:
+
+```c
+typedef struct _KSERVICE_TABLE_DESCRIPTOR {
+    PVOID   ServiceTableBase;   // base of array of function pointers 
+    PULONG  ServiceCounterTable;
+    ULONG   NumberOfServices;
+    PUCHAR  ParamTableBase;
+} KSERVICE_TABLE_DESCRIPTOR, *PKSERVICE_TABLE_DESCRIPTOR;
+```
+
+On x64, the service table is an array of relative offsets from a base, not raw pointers. The dispatcher logic looks something like this, stripped down:
+
+```c
+PVOID Base = KeServiceDescriptorTable.ServiceTableBase;
+ULONG Index = EAX;    // ssn
+PVOID Target = (PUCHAR)Base + (Index * sizeof(ULONG));
+Target = (PUCHAR)Base + *(PULONG)Target; // now here goes the real function
+
+// here we jump to target
+```
+
+There are multiple service tables (core, GUI, and more), but for syscall evasion the important bit is:
+
+- The mapping from syscall index to kernel routine is stable within a given OS build, but changes between builds.
+- Offensive frameworks either ship version-specific tables (SysWhispers2 style) or parse ntdll at runtime to recover indices (Hell’s Gate & friends), and also for example SysWhispers3.
+
+## 2. How defenders instrument syscalls in 2025
+
+### 2.1 User-mode inline hooks (still ubiquitous)
+
+Most EDRs still start in user-mode, as follows:
+
+Inject a sensor DLL into (almost) every process -> patch functions in kernel32.dll / kernelbase.dll / advapi32.dll or ntdll.dll (low-level Nt* calls) -> use inline hooking: overwrite the function prologue with a jump to EDR code.
+
+x64 inline hook demo:
+
+```asm
+; original prologue
+target:
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 0x40
+    <continue>
+
+; EDR patched
+target:
+    mov     rax, <EDR_Proxy>
+    jmp     rax
+```
+
+and if you are truly against instructions, here is a simplified C-ish view
+
+```c
+// Called from patched prologue
+void EdrProxy()
+{
+    // we inspect args such as, call stack, loaded modules, thread token... etc
+    if (should_block()) {
+        SetLastError(ACCESS_DENIED);
+        return;
+    }
+
+    // else we return to the original trampoline and continue classic prologue
+    return Original_Trampoline();
+}
+```
+
+This gives us:
+
+- Argument inspection (buffer addresses, sizes, access masks).
+- Per-thread context (token, call stack, originating module).
+- Optionally, ETW logging, telemetry aggregation, correlation.
+
+As rainbow and sunshine as this approach looks, attackers can rip these hooks out (unhook ntdll, map clean copies, and many more), but that’s exactly what led to the rise of direct syscalls.
+
+### 2.2 Kernel-mode interception via syscall entry
+
+To be resilient to user-mode hook tampering, some products monitor syscalls in kernel-mode.
+
+Lets take Palo Alto’s Cortex XDR approach:
+
+1. A kernel component gets control during the syscall dispatch pipeline.
+2. For each syscall, it accesses the built `KTRAP_FRAME` on the current thread’s kernel stack. 
+3. It reads the saved user RIP (return address).
+4. It resolves that RIP to module path + nearest export using an ImageTracker that tracks module loads/unloads system-wide.
+5. If the return address is not inside `ntdll.dll` / `win32u.dll` (so the call didn’t come from the canonical syscall stubs), the event is classified as a direct syscall, because it did not originate from a legitimate context.
+6. That event is fed into behavioral analytics and cloud models to determine if the pattern is benign (so legit, like game anti-cheat, security tools) or malicious.
+
+You can visualize the entire process as follows :
+
+![cmpa](https://raw.githubusercontent.com/tlsbollei/tlsbollei.github.io/refs/heads/master/imgs/blog/006Spoofing/compact.png)
+
+The important this is that,
+
+**Even if you completely bypass all user-mode hooks, the kernel can still see who executed the syscall by looking at the saved RIP in KTRAP_FRAME.**
+
+Some other kernel interception mechanisms that we have encountered in the wild included:
+
+- Alt-syscall dispatch, where Windows added PsAltSystemCallDispatch and PsRegisterAltSystemCallHandler to allow alternative syscall handlers, particularly for pico providers. As documented by [Lešnik](https://lesnik.cc/hooking-all-system-calls-in-windows-10-20h1/), these are protected by PatchGuard and intended for tightly controlled internal use.
+- ETW-based syscall interception, where past techniques like InfinityHook abused ETW circular kernel logger to intercept syscall dispatch by hijacking timer/performance callbacks. Microsoft hardened this (by protecting relevant structures with PatchGuard and static linking hal.dll). Some variants still exist, but they are very fragile and patch-sensitive.
+
+Commercial EDRs rarely play whack-a-mole with PatchGuard, instead they lean and rely on:
+
+1. Legitimate ETW providers.
+2. Syscall filters tied to code integrity / virtualization-based security (VBS).
+3. Hardware-backed telemetry, which we will discuss later on.
+
+### 2.3 Call stack inspection and API spoofing detection
+
+Many user-mode hooks don’t simply check arguments, instead they walk the call stack using APIs like `RtlCaptureStackBackTrace` / `StackWalk64` or their own custom unwinding.
+
+Some typical checks deployed are for example:
+
+- Does the immediate caller belong to the same module (like kernelbase calling into ntdll), or some weird RWX region?
+- Are there suspicious frames (heap allocations with `PAGE_EXECUTE_READWRITE`, `PAGE_EXECUTE_READ` from anonymous memory, module-less regions)?
+- Does the logical call chain (`CreateFileW` -> `NtCreateFile`) match the physical call stack?
+
+If a syscall appears to originate from unbacked memory or from a module that doesn’t usually make such calls, the EDR can treat the event as API spoofing or direct syscall abuse and flag it.
+
+This is the detection logic that VEH-based and call-stack-faking approaches try to break.
+
+### 3. Direct syscalls: Long live SysWhispers, the very noisy animal!
+
+## 3.1 Wut is this?
+
+A direct syscall (in red-team slang) is simply:
+
+1. You set up the registers (EAX = SSN, R10 = RCX, args) yourself.
+2. You emit syscall from your own code (or shellcode), in memory that is not the ntdll stub.
+
+```c
+__declspec(naked)
+NTSTATUS NtAllocateVirtualMemory_Direct(
+    HANDLE  ProcessHandle,
+    PVOID  *BaseAddress,
+    ULONG_PTR ZeroBits,
+    PSIZE_T RegionSize,
+    ULONG   AllocationType,
+    ULONG   Protect
+)
+{
+    __asm {
+        mov r10, rcx          
+        mov eax, 0x18         ; here we hardcode a random SSN - do not do this, extract dynamically
+        syscall
+        ret
+    }
+}
+```
+
+Frameworks like SysWhispers2/3 generate hundreds of these stubs with version-aware syscall numbers (SysWhispers2 used to hardcode, SysWhispers3 is smarter and dynamically retrieves SSNs), plus helper code to resolve the correct table per OS build.
+
+What does a defender see?
+
+- The syscall instruction resides in attacker-controlled memory (PE .text (or for that matter any PE struct region) or shellcode region).
+- The KTRAP_FRAME’s saved RIP will point back to that region, not to ntdll.
+- The call stack above that RIP may show weird frames (like shellcode, packed modules).
+
+### 3.2 Kernel-side detection via KTRAP_FRAME
+
+The Palo Alto / Cortex XDR approach lays out one concrete method, that we have already discussed:
+
+-Hook syscall dispatch at the kernel level.
+-For each syscall:
+
+1. Get the pointer to the KTRAP_FRAME
+2. Read the Rip field (saved user-mode instruction pointer).
+3. Resolve RIP to module using an image tracking subsystem (ImageTracker).
+4. If RIP is not in ntdll/win32u and not in a known, benign direct-syscall-using module, mark as direct syscall. 
+
+From this point, cyberdefense products can move into multiple directions:
+
+Events feed into local heuristics (what syscalls? which process? which memory region?).
+Events are also aggregated globally to build per-tenant and global baselines of deemed normal direct syscall usage.
+
+This is fundamentally resistant to common methods deployed by sophisticated attackers, such as:
+
+1. Unhooking ntdll.
+2. Mapping clean copies, like for example the /KnownDlls/ trick
+3. XORing your stubs and decrypting at runtime (the RIP is still where the syscall lives).
+4. Shellcoder games like Heaven’s Gate (you’re still executing syscall from non-ntdll memory).
+
+Windows Defender / MDE itself can also use CPU telemetry plus cloud analytics (via Intel TDT) to distinguish weird control-flow from known-good behaviors, even if the direct syscall itself is not explicitly labeled as such.
+
+### 3.3 So.. direct syscalls are dead?
+
+No, but they’re VERY noisy when used in isolation:
+
+Commodity direct-syscall loaders (unmodified SysWhispers + standard injection techniques) are often very trivially detectable by:
+
+- Kernel-mode RIP analysis.
+- Stack provenance checks.
+- Behavioral analytics (sudden spike of direct syscalls + RWX allocations).
+
+However, targeted offensive tooling, like sophisticated loaders and such, can still squish something out of direct syscalls, given:
+
+- Combined with short-lived usage.
+- Embedded into otherwise-trusted modules.
+- Layered with call-stack spoofing, indirect syscalls, or hardware-aware behavior.
+
+But, as of 2025,
+
+**Raw direct syscalls from shellcode or obviously unbacked regions are more of a training set for EDR analytics than a reliable stealth technique.**
+
+## 4. Indirect syscalls, direct evolution of Direct Sycalls
+
+### 4.1 Wut are indirect syscalls?
+
+- The syscall instruction still executes inside ntdll.dll / win32u.dll (or occasionally other legit system modules).
+- The attacker manipulates how execution reaches that stub:
+    1. Jumping into the middle of the stub.
+    2. Using jmp / call into a syscall; ret sequence previously laid out by Microsoft.
+    3. Leveraging ROP-like sequences that end in syscall without going through a hooked prologue.
+
+- The idea is:
+    1. EDR’s kernel-mode detection sees the KTRAP_FRAME.Rip pointing inside ntdll, so it resembles a normal syscall to naive detectors and security products.
+    2. User-mode hook detectors that only look for direct syscall from non-system modules miss it.
+    3. Stack-walkers may be fooled if the stack is carefully crafted.
+
+### 4.2 Hell’s Gate, Halo’s Gate, Tartarus’ Gate, RecycledGate
+
+These frameworks are often grouped together, and execute as follows:
+
+![aaa](https://raw.githubusercontent.com/tlsbollei/tlsbollei.github.io/refs/heads/master/imgs/blog/006Spoofing/gates.png)
+
+
+
+Point is: modern Gate variants are more about resolving correct SSNs and reusing legitimate syscall sites than about unhooking or patching anything.
+
+
+### 4.3 What defenders see
+
+Even with indirect syscalls:
+
+- Kernel-level detectors that only check “RIP in ntdll?” will be blind, but:
+  
+    1. Stack-walkers see who called into that stub.
+    2. Hardware telemetry (LBR / PT) sees the full branch history (like shellcode -> ntdll!NtAllocateVirtualMemory -> nt!NtAllocateVirtualMemory).
+
+EDRs that track which images normally execute which syscalls can still flag anomalies (so, a random business app executing NtCreateSection thousands of times).
+
+The defensive shift, and fundamental paradigm shift we have seen went from :
+
+“is this a direct syscall?”
+
+To “given the full call stack, LBR, and behavior, does this syscall make sense for this process/module at this time?”
+
+**Indirect syscalls stay useful, but only as part of a larger evasion story.**
+
+## 5. Stack fakery: VEH-based and CET-aware call-stack spoofingň
+
+If defenders walk the stack, attackers try to forge it.
+
+### 5.1 Classic stack-spoofing
+
+Basic approach (high-level):
+
+![spoof](https://github.com/tlsbollei/tlsbollei.github.io/blob/master/imgs/blog/006Spoofing/stackspoof.png)
+
+This can very well fool user-mode EDR hooks that only inspect frames, but:
+
+-  It may break under CET shadow stacks (section 7).
+-  Kernel observers still see that code execution came from weird places before hitting ntdll.
 
 With the evolution of cyber defence products, we've seen in the Red Teaming and Malware Development 
 community a rise in advanced memory evasion techniques, which aim to bypass the detection of
