@@ -1,6 +1,6 @@
 ---
 title: "Windows Syscalls in 2025: Direct, Indirect, and the Hardware-Assisted Arms Race"
-date: 202-11-23 14:20:00 +0100
+date: 2025-11-23 14:20:00 +0100
 categories: [Evasion, Malware, Syscalls]
 tags: [evasion, malware, system-calls]     # TAG names should always be lowercase
 ---
